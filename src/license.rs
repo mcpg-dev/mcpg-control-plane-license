@@ -681,6 +681,9 @@ pub fn enforcement_of(feature: &str) -> Option<FeatureEnforcement> {
         }
         "clustering" | "policy.advanced" => PaidNamespace,
         "tunnels.private" | "tunnels.e2ee" => DirectCheck("control-plane handlers/tunnels.rs"),
+        "plugins.custom" => {
+            DirectCheck("control-plane handlers/gateways.rs — target_validate PluginPolicy")
+        }
         "payload_capture" => DirectCheck("control-plane metrics ingest"),
         "byoc" | "sovereign" => ContractPosture,
         "sso.oidc" => Unenforced("control-plane OIDC is core and available to every tier"),
@@ -742,6 +745,9 @@ pub fn features_for(plan: &str) -> Vec<String> {
                 "field_crypto".into(),
                 "guardrails".into(),
                 "audit.worm".into(),
+                // Reference plugins the customer publishes themselves, from
+                // their own registry, rather than only first-party ones.
+                "plugins.custom".into(),
                 "sovereign".into(),
                 // End-to-end-encrypted tunnels (e2ee mode): the relay
                 // splices ciphertext, mcpg-to-mcpg only. The sovereign posture.
@@ -751,6 +757,18 @@ pub fn features_for(plan: &str) -> Vec<String> {
         .concat(),
         _ => vec![],
     }
+}
+
+/// Feature name gating a tenant's own plugins (see [`features_for`]).
+pub const FEATURE_CUSTOM_PLUGINS: &str = "plugins.custom";
+
+/// Whether `plan` may reference plugins the customer publishes themselves,
+/// rather than only first-party ones. Enterprise; asked through the feature
+/// list so the licence stays the single source of what a plan grants.
+pub fn allows_custom_plugins(plan: &str) -> bool {
+    features_for(plan)
+        .iter()
+        .any(|f| f == FEATURE_CUSTOM_PLUGINS)
 }
 
 /// Verify a license JWT against a trusted Ed25519 public key.
