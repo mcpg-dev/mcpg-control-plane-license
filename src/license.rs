@@ -1078,6 +1078,7 @@ mod tests {
             "dev.mcpg.backend.dynamodb",
             "dev.mcpg.backend.elasticsearch",
             "dev.mcpg.backend.hana",
+            "dev.mcpg.backend.oci-registry",
             "dev.mcpg.backend.http",
             "dev.mcpg.observability.prometheus",
             "dev.mcpg.observability.otlp",
