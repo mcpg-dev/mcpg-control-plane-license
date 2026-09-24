@@ -87,8 +87,8 @@ pub struct SessionId(pub Vec<u8>);
 impl SessionId {
     pub fn new() -> Self {
         let mut bytes = vec![0u8; 32];
-        use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut bytes);
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut bytes);
         Self(bytes)
     }
     pub fn as_bytes(&self) -> &[u8] {

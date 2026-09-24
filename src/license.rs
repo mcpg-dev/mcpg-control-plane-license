@@ -905,7 +905,6 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use jsonwebtoken::{EncodingKey, Header};
-    use rand::rngs::OsRng;
 
     fn sample_claims(exp_offset_secs: i64) -> LicenseClaims {
         let now = Utc::now().timestamp();
@@ -1117,7 +1116,7 @@ mod tests {
     fn round_trip_signed_license_verifies() {
         use ed25519_dalek::pkcs8::EncodePrivateKey;
 
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let signing_key = SigningKey::generate(&mut rand::rng());
         let pubkey = signing_key.verifying_key();
         let claims = sample_claims(3600);
 
