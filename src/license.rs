@@ -681,6 +681,11 @@ pub fn enforcement_of(feature: &str) -> Option<FeatureEnforcement> {
         }
         "clustering" | "policy.advanced" => PaidNamespace,
         "tunnels.private" | "tunnels.e2ee" => DirectCheck("control-plane handlers/tunnels.rs"),
+        FEATURE_INTERACTIVE_LOGIN => DirectCheck(
+            "gateway license_gate.rs (boot and reload of every config the managed-cloud \
+             platform did not render) and control-plane \
+             publish_guard::check_config_entitlements (managed-cloud publishes)",
+        ),
         "plugins.custom" => {
             DirectCheck("control-plane handlers/gateways.rs — target_validate PluginPolicy")
         }
@@ -752,6 +757,7 @@ pub fn features_for(plan: &str) -> Vec<String> {
                 // End-to-end-encrypted tunnels (e2ee mode): the relay
                 // splices ciphertext, mcpg-to-mcpg only. The sovereign posture.
                 "tunnels.e2ee".into(),
+                FEATURE_INTERACTIVE_LOGIN.into(),
             ],
         ]
         .concat(),
@@ -761,6 +767,12 @@ pub fn features_for(plan: &str) -> Vec<String> {
 
 /// Feature name gating a tenant's own plugins (see [`features_for`]).
 pub const FEATURE_CUSTOM_PLUGINS: &str = "plugins.custom";
+
+/// Feature name gating interactive sign-in at the gateway's embedded
+/// authorization server and the per-user store of enterprise IdP sign-ins
+/// it keeps: a `governance.access.authorization_server.trusted_idps[].login`
+/// block or an `authorization_server.interactive` block. Enterprise only.
+pub const FEATURE_INTERACTIVE_LOGIN: &str = "sso.interactive_login";
 
 /// Whether `plan` may reference plugins the customer publishes themselves,
 /// rather than only first-party ones. Enterprise; asked through the feature
@@ -982,6 +994,40 @@ mod tests {
             !features_for("community")
                 .iter()
                 .any(|f| f == "tunnels.private")
+        );
+    }
+
+    /// Interactive sign-in and the stored IdP sign-ins behind it are sold
+    /// on the enterprise plan alone, and are checked where configs are
+    /// admitted rather than at plugin load.
+    #[test]
+    fn interactive_login_is_enterprise_only() {
+        for plan in ["community", "pro", "team", "bogus"] {
+            assert!(
+                !features_for(plan)
+                    .iter()
+                    .any(|f| f == FEATURE_INTERACTIVE_LOGIN),
+                "{plan} must not grant {FEATURE_INTERACTIVE_LOGIN}"
+            );
+        }
+        let enterprise = features_for("enterprise");
+        assert_eq!(
+            enterprise
+                .iter()
+                .filter(|f| *f == FEATURE_INTERACTIVE_LOGIN)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            enforcement_of(FEATURE_INTERACTIVE_LOGIN),
+            Some(FeatureEnforcement::DirectCheck(site)) if site.contains("license_gate")
+                && site.contains("publish_guard")
+        ));
+        // A config surface, not a plugin: no plugin id maps to it.
+        assert!(
+            !["credential.oauth-id-jag", "identity.oidc", "identity.saml"]
+                .iter()
+                .any(|id| required_feature_for_plugin(id) == Some(FEATURE_INTERACTIVE_LOGIN))
         );
     }
 
