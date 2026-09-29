@@ -681,7 +681,7 @@ pub fn enforcement_of(feature: &str) -> Option<FeatureEnforcement> {
         }
         "clustering" | "policy.advanced" => PaidNamespace,
         "tunnels.private" | "tunnels.e2ee" => DirectCheck("control-plane handlers/tunnels.rs"),
-        FEATURE_INTERACTIVE_LOGIN => DirectCheck(
+        FEATURE_INTERACTIVE_LOGIN | FEATURE_DPOP | FEATURE_RICH_AUTHORIZATION => DirectCheck(
             "gateway license_gate.rs (boot and reload of every config the managed-cloud \
              platform did not render) and control-plane \
              publish_guard::check_config_entitlements (managed-cloud publishes)",
@@ -758,6 +758,8 @@ pub fn features_for(plan: &str) -> Vec<String> {
                 // splices ciphertext, mcpg-to-mcpg only. The sovereign posture.
                 "tunnels.e2ee".into(),
                 FEATURE_INTERACTIVE_LOGIN.into(),
+                FEATURE_DPOP.into(),
+                FEATURE_RICH_AUTHORIZATION.into(),
             ],
         ]
         .concat(),
@@ -773,6 +775,21 @@ pub const FEATURE_CUSTOM_PLUGINS: &str = "plugins.custom";
 /// it keeps: a `governance.access.authorization_server.trusted_idps[].login`
 /// block or an `authorization_server.interactive` block. Enterprise only.
 pub const FEATURE_INTERACTIVE_LOGIN: &str = "sso.interactive_login";
+
+/// Feature name gating DPoP-bound tokens (RFC 9449) at the gateway's
+/// embedded authorization server: a
+/// `governance.access.authorization_server.dpop` block with `enabled: true`.
+/// A block with `enabled: false` (the default) turns nothing on and needs no
+/// feature, whatever its other keys say. Enterprise only.
+pub const FEATURE_DPOP: &str = "oauth.dpop";
+
+/// Feature name gating rich authorization requests (RFC 9396) at the
+/// gateway's embedded authorization server: a
+/// `governance.access.authorization_server.authorization_details` block that
+/// lists at least one type. A block whose `types` is empty (the default)
+/// turns nothing on and needs no feature, whatever its `max_entries` says.
+/// Enterprise only.
+pub const FEATURE_RICH_AUTHORIZATION: &str = "oauth.rich_authorization";
 
 /// Whether `plan` may reference plugins the customer publishes themselves,
 /// rather than only first-party ones. Enterprise; asked through the feature
@@ -997,38 +1014,47 @@ mod tests {
         );
     }
 
-    /// Interactive sign-in and the stored IdP sign-ins behind it are sold
-    /// on the enterprise plan alone, and are checked where configs are
-    /// admitted rather than at plugin load.
+    /// Interactive sign-in (and the stored IdP sign-ins behind it), DPoP-bound
+    /// tokens and rich authorization requests are sold on the enterprise plan
+    /// alone, and are checked where configs are admitted rather than at
+    /// plugin load.
     #[test]
-    fn interactive_login_is_enterprise_only() {
-        for plan in ["community", "pro", "team", "bogus"] {
+    fn authorization_server_features_are_enterprise_only() {
+        assert_eq!(FEATURE_DPOP, "oauth.dpop");
+        assert_eq!(FEATURE_RICH_AUTHORIZATION, "oauth.rich_authorization");
+        for feature in [
+            FEATURE_INTERACTIVE_LOGIN,
+            FEATURE_DPOP,
+            FEATURE_RICH_AUTHORIZATION,
+        ] {
+            for plan in ["community", "pro", "team", "bogus"] {
+                assert!(
+                    !features_for(plan).iter().any(|f| f == feature),
+                    "{plan} must not grant {feature}"
+                );
+            }
+            let enterprise = features_for("enterprise");
+            assert_eq!(
+                enterprise.iter().filter(|f| *f == feature).count(),
+                1,
+                "{feature}"
+            );
             assert!(
-                !features_for(plan)
+                matches!(
+                    enforcement_of(feature),
+                    Some(FeatureEnforcement::DirectCheck(site)) if site.contains("license_gate")
+                        && site.contains("publish_guard")
+                ),
+                "{feature}"
+            );
+            // A config surface, not a plugin: no plugin id maps to it.
+            assert!(
+                !["credential.oauth-id-jag", "identity.oidc", "identity.saml"]
                     .iter()
-                    .any(|f| f == FEATURE_INTERACTIVE_LOGIN),
-                "{plan} must not grant {FEATURE_INTERACTIVE_LOGIN}"
+                    .any(|id| required_feature_for_plugin(id) == Some(feature)),
+                "{feature}"
             );
         }
-        let enterprise = features_for("enterprise");
-        assert_eq!(
-            enterprise
-                .iter()
-                .filter(|f| *f == FEATURE_INTERACTIVE_LOGIN)
-                .count(),
-            1
-        );
-        assert!(matches!(
-            enforcement_of(FEATURE_INTERACTIVE_LOGIN),
-            Some(FeatureEnforcement::DirectCheck(site)) if site.contains("license_gate")
-                && site.contains("publish_guard")
-        ));
-        // A config surface, not a plugin: no plugin id maps to it.
-        assert!(
-            !["credential.oauth-id-jag", "identity.oidc", "identity.saml"]
-                .iter()
-                .any(|id| required_feature_for_plugin(id) == Some(FEATURE_INTERACTIVE_LOGIN))
-        );
     }
 
     #[test]
