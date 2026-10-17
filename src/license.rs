@@ -62,7 +62,8 @@ pub struct LicenseClaims {
     #[serde(default)]
     pub metadata: serde_json::Value,
 
-    /// Subscription-lapse grace timing (when set by federation).
+    /// Set by the federation while a renewal is unpaid and the plan is still
+    /// issued: when the first payment failed and when the plan reverts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grace: Option<GraceWindow>,
 
@@ -123,7 +124,110 @@ pub struct LicenseClaims {
     /// still refusing an unrelated presenter.
     #[serde(default)]
     pub issued_to: Option<String>,
+
+    /// The licence is for non-production use only (development, testing,
+    /// evaluation, staging). Every licence a staging issuer key signs carries
+    /// it; a deployment running under it shows the marker in its logs, status
+    /// and metrics.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub non_production: bool,
 }
+
+/// Audience of every licence a control plane accepts.
+pub const AUDIENCE_CP: &str = "mcpg-cp";
+/// Audience of a self-host licence a gateway accepts from its own `license:`
+/// block.
+pub const AUDIENCE_GATEWAY: &str = "mcpg-gateway";
+/// Audience of a licence the managed platform delivers to a gateway. A cloud
+/// licence names this and not [`AUDIENCE_GATEWAY`], so it is never a valid
+/// self-host gateway licence.
+pub const AUDIENCE_GATEWAY_MANAGED: &str = "mcpg-gateway-managed";
+
+pub use crate::trust;
+pub use crate::trust::{
+    IssuerRole, KeyEnvironment, LICENSE_JWT_TYP, TrustPolicy, VendorLicense, thumbprint_kid,
+    verify_vendor_license,
+};
+
+/// Days before `exp` from which a deployment warns that its licence expires.
+pub const EXPIRY_WARNING_DAYS: i64 = 30;
+/// Days after `exp` during which an expired self-host licence still grants
+/// its plan, with warnings.
+pub const EXPIRY_GRACE_DAYS: i64 = 14;
+/// Days after `exp` during which an mcpg.cloud licence still grants its plan.
+/// The platform re-issues a cloud licence before it expires, so an expired one
+/// means its refresh is failing; a revoked one is replaced at once instead.
+pub const CLOUD_REFRESH_GRACE_DAYS: i64 = 7;
+
+/// Days after `exp` a licence signed by a key of `role` keeps its plan.
+pub fn expiry_grace_days(role: IssuerRole) -> i64 {
+    match role {
+        IssuerRole::SelfHost => EXPIRY_GRACE_DAYS,
+        IssuerRole::Cloud => CLOUD_REFRESH_GRACE_DAYS,
+        // No licence policy accepts a platform key's signature.
+        IssuerRole::Platform => 0,
+    }
+}
+
+/// Where a licence stands against its expiry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LicenseTerm {
+    /// More than [`EXPIRY_WARNING_DAYS`] from `exp`.
+    Current,
+    /// Within [`EXPIRY_WARNING_DAYS`] of `exp`.
+    ExpiringSoon,
+    /// Past `exp`, within its grace period ([`expiry_grace_days`]): the plan
+    /// still holds.
+    Grace,
+    /// Past the grace period: the licence grants nothing.
+    Lapsed,
+}
+
+impl LicenseTerm {
+    /// The term of a self-host licence: [`EXPIRY_GRACE_DAYS`] of grace.
+    pub fn of(exp: i64, now: i64) -> Self {
+        Self::with_grace(exp, now, EXPIRY_GRACE_DAYS)
+    }
+
+    /// The term of a licence that keeps its plan `grace_days` past `exp`.
+    pub fn with_grace(exp: i64, now: i64, grace_days: i64) -> Self {
+        const DAY: i64 = 86_400;
+        if now >= grace_ends_after(exp, grace_days) {
+            LicenseTerm::Lapsed
+        } else if now >= exp {
+            LicenseTerm::Grace
+        } else if now >= exp.saturating_sub(EXPIRY_WARNING_DAYS * DAY) {
+            LicenseTerm::ExpiringSoon
+        } else {
+            LicenseTerm::Current
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LicenseTerm::Current => "current",
+            LicenseTerm::ExpiringSoon => "expiring",
+            LicenseTerm::Grace => "grace",
+            LicenseTerm::Lapsed => "lapsed",
+        }
+    }
+}
+
+/// When the grace period of a self-host licence expiring at `exp` ends.
+pub fn grace_ends_at(exp: i64) -> i64 {
+    grace_ends_after(exp, EXPIRY_GRACE_DAYS)
+}
+
+/// When a grace period of `grace_days` past `exp` ends.
+pub fn grace_ends_after(exp: i64, grace_days: i64) -> i64 {
+    exp.saturating_add(grace_days.saturating_mul(86_400))
+}
+
+/// Days a managed org keeps what it runs after it loses a paid plan — a
+/// downgrade, a cancellation, a suspension, or an unpaid renewal, whose days
+/// count from its first failed payment. New work is judged by the plan left at
+/// once; what already runs stays until the grace ends.
+pub const PLAN_LOSS_GRACE_DAYS: i64 = 7;
 
 /// Support tier assigned when a token omits `support_tier`.
 pub const SUPPORT_TIER_NONE: &str = "none";
@@ -199,9 +303,9 @@ pub struct Quotas {
     /// = use the CP's hardcoded default (48 hours).
     #[serde(default)]
     pub tool_invocations_retention_hours: u64,
-    /// Cap on tool calls per month per tenant. `0` = unlimited.
-    /// Enforced at ingest time by counting rows in the rollup
-    /// table over the trailing 30 days.
+    /// Tool calls included per month per tenant. `0` = unlimited.
+    /// Counted over the UTC calendar month; on mcpg.cloud a paid plan is
+    /// served past it on packs and pay-as-you-go up to its spend cap.
     #[serde(default)]
     pub tool_calls_per_month: u64,
     /// Cap on concurrently-registered reverse tunnels. `0`
@@ -211,8 +315,193 @@ pub struct Quotas {
     /// — not bandwidth — is the tunnel value metric.
     #[serde(default)]
     pub tunnels: u64,
+    /// Reverse-tunnel bytes relayed per calendar month (UTC) at no charge.
+    /// `0` = unlimited. A paid plan pays for the bytes above it; the free plan
+    /// is throttled past it, never stopped and never billed. `None` in a
+    /// licence or plan snapshot issued before this axis existed; read it
+    /// through [`Quotas::tunnel_bytes_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_bytes_per_month: Option<u64>,
+    /// Managed-instance hours included per calendar month (UTC), counted in
+    /// s-equivalents (see [`COMPUTE_WEIGHTS`]). `0` = unlimited. A paid plan
+    /// pays for the hours above it; the free plan is never charged. `None` in
+    /// a licence or plan snapshot issued before this axis existed; read it
+    /// through [`Quotas::included_compute_hours_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub included_compute_hours_per_month: Option<u64>,
+    /// Cap on live MCP Events readers on each gateway: webhook subscriptions,
+    /// poll leases and open streams, plus the upstream subscriptions the
+    /// gateway holds for imported event types. `0` = unlimited. `None` in a
+    /// licence issued before this axis existed; read it through
+    /// [`Quotas::event_subscriptions_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_subscriptions: Option<u64>,
+    /// MCP Events deliveries included per calendar month (UTC), in every
+    /// mode. `0` = unlimited. The free plan's deliveries hold once the
+    /// month's are used; on mcpg.cloud a paid plan is served past it
+    /// pay-as-you-go up to its spend cap. `None` in a licence issued before
+    /// this axis existed; read it through [`Quotas::events_delivered_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_delivered_per_month: Option<u64>,
+    /// MCP Events occurrences taken into event logs per calendar month
+    /// (UTC), from every source. `0` = unlimited. Sources are held once the
+    /// month's are used. `None` in a licence issued before this axis existed;
+    /// read it through [`Quotas::events_ingested_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events_ingested_per_month: Option<u64>,
+    /// Cap on the MCP Events types one gateway serves, declared and imported.
+    /// `0` = unlimited. Read it through [`Quotas::event_types_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_types: Option<u64>,
+    /// Longest an event log keeps an occurrence, in milliseconds. `0` =
+    /// unlimited. Read it through [`Quotas::event_retention_ms_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_retention_ms: Option<u64>,
+    /// Most occurrences one event log keeps. `0` = unlimited. Read it
+    /// through [`Quotas::event_retention_events_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_retention_events: Option<u64>,
+    /// Most bytes one event log keeps. `0` = unlimited. Read it through
+    /// [`Quotas::event_retention_bytes_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_retention_bytes: Option<u64>,
+    /// Longest a webhook delivery is retried, in milliseconds. `0` =
+    /// unlimited. Read it through [`Quotas::event_retry_window_ms_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_retry_window_ms: Option<u64>,
 }
 
+impl Quotas {
+    /// The monthly tunnel-byte allowance of `plan` under these quotas: the
+    /// value they carry, else the plan's compiled one. `0` = unlimited.
+    pub fn tunnel_bytes_for(&self, plan: &str) -> u64 {
+        self.tunnel_bytes_per_month
+            .or_else(|| plan_envelope(plan).1.tunnel_bytes_per_month)
+            .unwrap_or(0)
+    }
+
+    /// The monthly included compute of `plan` under these quotas, in
+    /// s-equivalent instance-hours: the value they carry, else the plan's
+    /// compiled one. `0` = unlimited.
+    pub fn included_compute_hours_for(&self, plan: &str) -> u64 {
+        self.included_compute_hours_per_month
+            .or_else(|| plan_envelope(plan).1.included_compute_hours_per_month)
+            .unwrap_or(0)
+    }
+
+    /// The live event reader cap of `plan` under these quotas: the value
+    /// they carry, else the plan's compiled one. `0` = unlimited.
+    pub fn event_subscriptions_for(&self, plan: &str) -> u64 {
+        self.event_subscriptions
+            .or_else(|| plan_envelope(plan).1.event_subscriptions)
+            .unwrap_or(0)
+    }
+
+    /// The monthly MCP Events delivery allowance of `plan` under these
+    /// quotas: the value they carry, else the plan's compiled one. `0` =
+    /// unlimited.
+    pub fn events_delivered_for(&self, plan: &str) -> u64 {
+        self.events_delivered_per_month
+            .or_else(|| plan_envelope(plan).1.events_delivered_per_month)
+            .unwrap_or(0)
+    }
+
+    /// The monthly MCP Events ingest allowance of `plan` under these
+    /// quotas: the value they carry, else the plan's compiled one. `0` =
+    /// unlimited.
+    pub fn events_ingested_for(&self, plan: &str) -> u64 {
+        self.events_ingested_per_month
+            .or_else(|| plan_envelope(plan).1.events_ingested_per_month)
+            .unwrap_or(0)
+    }
+
+    /// The event type cap of `plan` under these quotas. `0` = unlimited.
+    pub fn event_types_for(&self, plan: &str) -> u64 {
+        self.event_types
+            .or_else(|| plan_envelope(plan).1.event_types)
+            .unwrap_or(0)
+    }
+
+    /// The event retention age cap of `plan` under these quotas, in
+    /// milliseconds. `0` = unlimited.
+    pub fn event_retention_ms_for(&self, plan: &str) -> u64 {
+        self.event_retention_ms
+            .or_else(|| plan_envelope(plan).1.event_retention_ms)
+            .unwrap_or(0)
+    }
+
+    /// The event retention count cap of `plan` under these quotas. `0` =
+    /// unlimited.
+    pub fn event_retention_events_for(&self, plan: &str) -> u64 {
+        self.event_retention_events
+            .or_else(|| plan_envelope(plan).1.event_retention_events)
+            .unwrap_or(0)
+    }
+
+    /// The event retention byte cap of `plan` under these quotas. `0` =
+    /// unlimited.
+    pub fn event_retention_bytes_for(&self, plan: &str) -> u64 {
+        self.event_retention_bytes
+            .or_else(|| plan_envelope(plan).1.event_retention_bytes)
+            .unwrap_or(0)
+    }
+
+    /// The webhook retry window cap of `plan` under these quotas, in
+    /// milliseconds. `0` = unlimited.
+    pub fn event_retry_window_ms_for(&self, plan: &str) -> u64 {
+        self.event_retry_window_ms
+            .or_else(|| plan_envelope(plan).1.event_retry_window_ms)
+            .unwrap_or(0)
+    }
+
+    /// Lift every MCP Events cap: each event axis becomes `0`, unlimited.
+    pub fn clear_event_caps(&mut self) {
+        self.event_subscriptions = Some(0);
+        self.events_delivered_per_month = Some(0);
+        self.events_ingested_per_month = Some(0);
+        self.event_types = Some(0);
+        self.event_retention_ms = Some(0);
+        self.event_retention_events = Some(0);
+        self.event_retention_bytes = Some(0);
+        self.event_retry_window_ms = Some(0);
+    }
+
+    /// Take every MCP Events cap from `from`, keeping the other axes.
+    pub fn copy_event_caps(&mut self, from: &Quotas) {
+        self.event_subscriptions = from.event_subscriptions;
+        self.events_delivered_per_month = from.events_delivered_per_month;
+        self.events_ingested_per_month = from.events_ingested_per_month;
+        self.event_types = from.event_types;
+        self.event_retention_ms = from.event_retention_ms;
+        self.event_retention_events = from.event_retention_events;
+        self.event_retention_bytes = from.event_retention_bytes;
+        self.event_retry_window_ms = from.event_retry_window_ms;
+    }
+
+    /// These quotas with every plan-backed axis resolved to the value in
+    /// force for `plan`, so a reader that does not know the fallbacks sees
+    /// what is enforced.
+    pub fn resolved_for(&self, plan: &str) -> Quotas {
+        Quotas {
+            tunnel_bytes_per_month: Some(self.tunnel_bytes_for(plan)),
+            included_compute_hours_per_month: Some(self.included_compute_hours_for(plan)),
+            event_subscriptions: Some(self.event_subscriptions_for(plan)),
+            events_delivered_per_month: Some(self.events_delivered_for(plan)),
+            events_ingested_per_month: Some(self.events_ingested_for(plan)),
+            event_types: Some(self.event_types_for(plan)),
+            event_retention_ms: Some(self.event_retention_ms_for(plan)),
+            event_retention_events: Some(self.event_retention_events_for(plan)),
+            event_retention_bytes: Some(self.event_retention_bytes_for(plan)),
+            event_retry_window_ms: Some(self.event_retry_window_ms_for(plan)),
+            ..self.clone()
+        }
+    }
+}
+
+/// The days a paid licence is still issued while its renewal is unpaid, in
+/// unix seconds: from the first failed payment (`soft_warn_at`) to the moment
+/// the plan reverts (`hard_revert_at`). A control plane anchors the plan-loss
+/// grace here rather than at the later moment the plan drops.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraceWindow {
     pub soft_warn_at: i64,
@@ -269,7 +558,13 @@ impl LicenseClaims {
             support_tier: default_support_tier(),
             license_class: default_license_class(),
             issued_to: None,
+            non_production: false,
         }
+    }
+
+    /// Where this licence stands against its expiry at `now` (unix seconds).
+    pub fn term(&self, now: i64) -> LicenseTerm {
+        LicenseTerm::of(self.exp, now)
     }
 
     /// Returns `true` iff the given plugin id is covered by any
@@ -428,7 +723,8 @@ pub fn required_feature_for_plugin(plugin_id: &str) -> Option<&'static str> {
 
 /// Namespaces holding no free plugins — a lower tier's envelope never
 /// admits them, so membership alone marks a plugin as paid
-/// (`plan_envelope` adds them only from `pro`/`team` upward).
+/// (`plan_envelope` admits them only from `pro` upward, and `cluster.`
+/// only through enterprise's `*`).
 pub const PAID_NAMESPACES: &[&str] = &["payment.", "policy.", "cluster.", "secret."];
 
 /// Returns `true` iff `plugin_id` is a first-party plugin the
@@ -442,6 +738,22 @@ pub fn is_entitlement_gated(plugin_id: &str) -> bool {
         .unwrap_or(plugin_id);
     required_feature_for_plugin(plugin_id).is_some()
         || PAID_NAMESPACES.iter().any(|ns| reduced.starts_with(ns))
+}
+
+/// Licence feature the mcpg.cloud federation adds to the managed licence of a
+/// plan that grants `clustering` but whose entitlements leave out the
+/// `cluster.*` plugins: it admits [`PLATFORM_COORDINATOR_PLUGIN`], which the
+/// platform itself adds to a multi-replica gateway. It is not a plan feature:
+/// no plan grants it, the self-host issuer never sets it, and a tenant's own
+/// publish of the plugin is still checked against the plan.
+pub const FEATURE_PLATFORM_COORDINATION: &str = "platform.cluster_coordination";
+
+/// The coordinator the managed platform adds to a multi-replica gateway.
+pub const PLATFORM_COORDINATOR_PLUGIN: &str = "dev.mcpg.cluster.nats";
+
+/// Whether `claims` admit `plugin_id` as the coordinator the platform adds.
+pub fn admits_platform_coordinator(claims: &LicenseClaims, plugin_id: &str) -> bool {
+    plugin_id == PLATFORM_COORDINATOR_PLUGIN && claims.has_feature(FEATURE_PLATFORM_COORDINATION)
 }
 
 /// Why `plugin_id` may not run under `claims` — `None` means permitted.
@@ -522,17 +834,41 @@ pub fn regions_for(plan: &str) -> Vec<String> {
     }
 }
 
-/// The compute type every plan includes at no charge.
+/// The default compute type: a publish that names no size gets it, and it is
+/// the only one the free plan may select (see the publish-path size ceiling).
 ///
-/// Compute is billed only when a tenant opts UP from this: the included type
-/// covers every running gateway a plan's quota allows, replicas included, and
-/// costs nothing. Community may select nothing else (see the publish-path size
-/// ceiling), so a free tenant is never billed for compute at all.
-///
-/// Shared by the control plane, which defaults a publish to this size, and the
-/// federation, which skips it when metering instance-hours — two copies would
-/// let a tenant be charged for the type they were told is free.
+/// The free plan is never charged for compute. A paid plan pays for the
+/// instance-hours above its included compute, counted in s-equivalents.
 pub const INCLUDED_COMPUTE_SIZE: &str = "s";
+
+/// Every compute type a managed instance runs as, smallest first. Each one is
+/// a billed dimension on paid plans, so the federation needs a metered price
+/// for every entry. A plan's included compute covers the types in this order.
+pub const COMPUTE_SIZES: [&str; 4] = ["s", "m", "l", "xl"];
+
+/// How many s-equivalent hours one instance-hour of each compute type counts
+/// for, in [`COMPUTE_SIZES`] order.
+pub const COMPUTE_WEIGHTS: [(&str, u64); 4] = [("s", 1), ("m", 2), ("l", 4), ("xl", 8)];
+
+/// The s-equivalent weight of a compute type; `None` for an unknown type.
+pub fn s_equivalent_weight(size: &str) -> Option<u64> {
+    COMPUTE_WEIGHTS
+        .iter()
+        .find(|(s, _)| *s == size)
+        .map(|(_, w)| *w)
+}
+
+/// One gibibyte, the unit tunnel-byte allowances are set in.
+const GIB: u64 = 1 << 30;
+/// The hours of the longest month, the unit included compute is set in: one
+/// always-on gateway on `s` for a whole month.
+const MONTH_HOURS: u64 = 31 * 24;
+/// One mebibyte, the unit event-log byte caps are set in.
+const MIB: u64 = 1 << 20;
+/// One minute and one day in milliseconds, the units event time caps are
+/// set in.
+const MINUTE_MS: u64 = 60_000;
+const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
 
 pub fn plan_envelope(plan: &str) -> (Vec<String>, Quotas) {
     let core_globs = vec![
@@ -580,15 +916,26 @@ pub fn plan_envelope(plan: &str) -> (Vec<String>, Quotas) {
                 tool_invocations_retention_hours: 48,
                 tool_calls_per_month: 1_000_000,
                 tunnels: 3,
+                tunnel_bytes_per_month: Some(10 * GIB),
+                included_compute_hours_per_month: Some(MONTH_HOURS),
+                event_subscriptions: Some(100),
+                events_delivered_per_month: Some(1_000_000),
+                events_ingested_per_month: Some(1_000_000),
+                event_types: Some(100),
+                event_retention_ms: Some(7 * DAY_MS),
+                event_retention_events: Some(100_000),
+                event_retention_bytes: Some(64 * MIB),
+                event_retry_window_ms: Some(60 * MINUTE_MS),
             },
         ),
         "team" => (
             [
                 core_globs.clone(),
+                // No `cluster.*`: running more than one replica is an
+                // Enterprise feature (`clustering`), self-hosted or managed.
                 vec![
                     "payment.*".into(),
                     "policy.*".into(),
-                    "cluster.*".into(),
                     "secret.*".into(),
                     // Backends are gated per-plugin by `required_feature_for_plugin`
                     // (e.g. `backend.warehouse`); the glob admits them so team's
@@ -609,6 +956,16 @@ pub fn plan_envelope(plan: &str) -> (Vec<String>, Quotas) {
                 tool_invocations_retention_hours: 96,
                 tool_calls_per_month: 10_000_000,
                 tunnels: 10,
+                tunnel_bytes_per_month: Some(100 * GIB),
+                included_compute_hours_per_month: Some(3 * MONTH_HOURS),
+                event_subscriptions: Some(1_000),
+                events_delivered_per_month: Some(10_000_000),
+                events_ingested_per_month: Some(10_000_000),
+                event_types: Some(1_000),
+                event_retention_ms: Some(30 * DAY_MS),
+                event_retention_events: Some(1_000_000),
+                event_retention_bytes: Some(256 * MIB),
+                event_retry_window_ms: Some(6 * 60 * MINUTE_MS),
             },
         ),
         "enterprise" => (
@@ -625,6 +982,17 @@ pub fn plan_envelope(plan: &str) -> (Vec<String>, Quotas) {
                 tool_invocations_retention_hours: 168,
                 tool_calls_per_month: 0,
                 tunnels: 0,
+                tunnel_bytes_per_month: Some(0),
+                // Unlimited unless a contract sets a value.
+                included_compute_hours_per_month: Some(0),
+                event_subscriptions: Some(0),
+                events_delivered_per_month: Some(0),
+                events_ingested_per_month: Some(0),
+                event_types: Some(0),
+                event_retention_ms: Some(0),
+                event_retention_events: Some(0),
+                event_retention_bytes: Some(0),
+                event_retry_window_ms: Some(0),
             },
         ),
         // Default / community fallback — the metered free tier.
@@ -643,6 +1011,18 @@ pub fn plan_envelope(plan: &str) -> (Vec<String>, Quotas) {
                 // The free wedge: one public dev tunnel (ngrok-for-MCP). Private
                 // reverse-federation tunnels need the `tunnels.private` feature.
                 tunnels: 1,
+                tunnel_bytes_per_month: Some(5 * GIB),
+                // Never charged: it only prorates a free stretch of a month
+                // that ends on a paid plan.
+                included_compute_hours_per_month: Some(MONTH_HOURS),
+                event_subscriptions: Some(10),
+                events_delivered_per_month: Some(10_000),
+                events_ingested_per_month: Some(10_000),
+                event_types: Some(10),
+                event_retention_ms: Some(DAY_MS),
+                event_retention_events: Some(1_000),
+                event_retention_bytes: Some(MIB),
+                event_retry_window_ms: Some(5 * MINUTE_MS),
             },
         ),
     }
@@ -679,17 +1059,31 @@ pub fn enforcement_of(feature: &str) -> Option<FeatureEnforcement> {
         | "approvals.hitl" | "secrets.dynamic" | "backend.enterprise" | "identity.advanced" => {
             PluginGate
         }
-        "clustering" | "policy.advanced" => PaidNamespace,
+        FEATURE_CLUSTERING | "policy.advanced" => PaidNamespace,
         "tunnels.private" | "tunnels.e2ee" => DirectCheck("control-plane handlers/tunnels.rs"),
         FEATURE_INTERACTIVE_LOGIN | FEATURE_DPOP | FEATURE_RICH_AUTHORIZATION => DirectCheck(
-            "gateway license_gate.rs (boot and reload of every config the managed-cloud \
-             platform did not render) and control-plane \
+            "gateway license_gate.rs (boot and reload of every gateway, against its own \
+             licence or the one the platform delivers) and control-plane \
              publish_guard::check_config_entitlements (managed-cloud publishes)",
         ),
-        "plugins.custom" => {
-            DirectCheck("control-plane handlers/gateways.rs — target_validate PluginPolicy")
-        }
+        "plugins.custom" => DirectCheck(
+            "control-plane publish_guard::check_config_entitlements (plugin sources, registry \
+             settings, trusted keys) and target_validate PluginPolicy (managed-cloud publishes)",
+        ),
         "payload_capture" => DirectCheck("control-plane metrics ingest"),
+        FEATURE_EVENTS_WEBHOOKS => DirectCheck(
+            "gateway license_gate.rs (boot and reload; an attached gateway whose delivered \
+             licence stops covering it stops delivering) and control-plane \
+             publish_guard::check_config_entitlements (managed-cloud publishes)",
+        ),
+        FEATURE_SSO_ENTERPRISE => DirectCheck("control-plane handlers/sso.rs"),
+        FEATURE_ISOLATION_DEDICATED => {
+            DirectCheck("control-plane handlers/gateways.rs (managed-cloud publishes)")
+        }
+        FEATURE_HYBRID_GATEWAYS => DirectCheck(
+            "control-plane handlers/enrollment.rs and grpc.rs Register (a self-registered \
+             gateway enrolling into the managed service)",
+        ),
         "byoc" | "sovereign" => ContractPosture,
         "sso.oidc" => Unenforced("control-plane OIDC is core and available to every tier"),
         "audit.export" => {
@@ -713,10 +1107,11 @@ pub fn features_for(plan: &str) -> Vec<String> {
     // withheld from lower tiers by the paid-namespace rule.
     let team_features = || -> Vec<String> {
         vec![
+            FEATURE_EVENTS_WEBHOOKS.into(),
             "sso.oidc".into(),
             "sso.saml".into(),
+            FEATURE_SSO_ENTERPRISE.into(),
             "audit.export".into(),
-            "clustering".into(),
             "policy.advanced".into(),
             "secrets.dynamic".into(),
             "approvals.hitl".into(),
@@ -734,11 +1129,17 @@ pub fn features_for(plan: &str) -> Vec<String> {
     };
 
     match plan {
-        "pro" => vec!["sso.oidc".into(), "audit.export".into()],
+        "community" | "free" => vec![FEATURE_EVENTS_WEBHOOKS.into()],
+        "pro" => vec![
+            FEATURE_EVENTS_WEBHOOKS.into(),
+            "sso.oidc".into(),
+            "audit.export".into(),
+        ],
         "team" => team_features(),
         "enterprise" => [
             team_features(),
             vec![
+                FEATURE_CLUSTERING.into(),
                 "sso.kerberos".into(),
                 "byoc".into(),
                 // The gateway gates full request/response capture on the
@@ -760,6 +1161,8 @@ pub fn features_for(plan: &str) -> Vec<String> {
                 FEATURE_INTERACTIVE_LOGIN.into(),
                 FEATURE_DPOP.into(),
                 FEATURE_RICH_AUTHORIZATION.into(),
+                FEATURE_ISOLATION_DEDICATED.into(),
+                FEATURE_HYBRID_GATEWAYS.into(),
             ],
         ]
         .concat(),
@@ -769,6 +1172,32 @@ pub fn features_for(plan: &str) -> Vec<String> {
 
 /// Feature name gating a tenant's own plugins (see [`features_for`]).
 pub const FEATURE_CUSTOM_PLUGINS: &str = "plugins.custom";
+
+/// Feature name gating MCP Events webhook delivery: an
+/// `mcp.configurations.events` block that is enabled with its `webhook`
+/// delivery on. Every plan, the community tier included; withheld, the
+/// gateway refuses the config, or on an attached gateway stops delivering.
+pub const FEATURE_EVENTS_WEBHOOKS: &str = "events.webhooks";
+
+/// Feature name gating a dedicated isolation tier on the managed service: a
+/// publish placed on cells reserved for the org rather than the shared pool.
+/// Enterprise only.
+pub const FEATURE_ISOLATION_DEDICATED: &str = "isolation.dedicated";
+
+/// Feature name gating hybrid gateways: a gateway the org runs on its own
+/// infrastructure and enrolls into the managed service itself, on an
+/// enrollment token not bound to a published instance. Enterprise only.
+pub const FEATURE_HYBRID_GATEWAYS: &str = "gateways.hybrid";
+
+/// Feature name for high availability: the `cluster.*` coordinators that let
+/// a gateway run more than one replica, self-hosted or managed. Enterprise
+/// only; withheld through the `cluster.` paid namespace.
+pub const FEATURE_CLUSTERING: &str = "clustering";
+
+/// Feature name gating self-service enterprise SSO: an org owner connects
+/// the org's own IdP and routes a verified email domain's sign-ins to it.
+/// Team and Enterprise.
+pub const FEATURE_SSO_ENTERPRISE: &str = "sso.enterprise";
 
 /// Feature name gating interactive sign-in at the gateway's embedded
 /// authorization server and the per-user store of enterprise IdP sign-ins
@@ -800,13 +1229,15 @@ pub fn allows_custom_plugins(plan: &str) -> bool {
         .any(|f| f == FEATURE_CUSTOM_PLUGINS)
 }
 
-/// Verify a license JWT against a trusted Ed25519 public key.
+/// Verify a license JWT against one given Ed25519 public key.
 ///
 /// Validates: signature, alg=`EdDSA`, audience contains
 /// `expected_aud`, lic_ver ≤ `MAX_SUPPORTED_LIC_VER`, current
 /// time within `nbf..exp`.
 ///
-/// Returns the parsed claims on success.
+/// Returns the parsed claims on success. The key is whatever the caller
+/// passes, so this is an issuer-side check (does a token carry what I signed);
+/// deciding whether to honour a licence is [`verify_vendor_license`]'s job.
 pub fn verify_license(
     token: &str,
     trust_anchor: &VerifyingKey,
@@ -848,6 +1279,30 @@ pub enum LicenseError {
         "plugin `{plugin}` requires the `{feature}` plan feature, which this license does not grant"
     )]
     FeatureNotLicensed { plugin: String, feature: String },
+
+    #[error(
+        "license is not signed by an MCPG licence issuer key this build trusts (kid `{0}`); \
+         only licences MCPG issues are accepted"
+    )]
+    UntrustedIssuerKey(String),
+
+    #[error("license is signed by issuer key `{0}`, which MCPG has revoked")]
+    RevokedIssuerKey(String),
+
+    #[error("license is signed by `{kid}`, a {role} issuer key, which is not accepted here")]
+    IssuerRoleNotAccepted { kid: String, role: &'static str },
+
+    #[error(
+        "license is signed by staging issuer key `{0}` but does not mark non_production use; \
+         a staging key signs only non-production licences"
+    )]
+    StagingKeyProductionLicense(String),
+
+    #[error("the embedded licence issuer key set is malformed: {0}")]
+    IssuerKeySet(String),
+
+    #[error("the licence delivery proof does not verify: {0}")]
+    DeliveryProof(String),
 }
 
 /// Parse an Ed25519 verifying key from an SPKI PEM string — the
@@ -930,6 +1385,168 @@ mod tests {
         let c: LicenseClaims = serde_json::from_value(old).expect("older token must still parse");
         assert_eq!(c.residency(), "default");
         assert!(c.allowed_regions.is_empty());
+        // No tunnel-byte axis in the token: its plan's compiled allowance
+        // stands, never "0 = unlimited".
+        assert_eq!(c.quotas.tunnel_bytes_per_month, None);
+        assert_eq!(
+            c.quotas.tunnel_bytes_for("team"),
+            plan_envelope("team").1.tunnel_bytes_per_month.unwrap()
+        );
+        // The same for included compute: the plan's hours, never unlimited.
+        assert_eq!(c.quotas.included_compute_hours_per_month, None);
+        assert_eq!(c.quotas.included_compute_hours_for("team"), 3 * MONTH_HOURS);
+        assert_ne!(c.quotas.included_compute_hours_for("team"), 0);
+    }
+
+    #[test]
+    fn included_compute_is_counted_in_s_equivalent_hours() {
+        let hours = |plan: &str| {
+            plan_envelope(plan)
+                .1
+                .included_compute_hours_per_month
+                .unwrap()
+        };
+        assert_eq!(MONTH_HOURS, 31 * 24);
+        assert_eq!(hours("team"), 3 * 31 * 24, "three always-on s gateways");
+        assert_eq!(hours("pro"), 31 * 24, "one always-on s gateway");
+        assert_eq!(hours("community"), 31 * 24);
+        assert_eq!(hours("bogus"), hours("community"));
+        assert_eq!(hours("enterprise"), 0, "0 = unlimited");
+    }
+
+    #[test]
+    fn every_compute_type_has_an_s_equivalent_weight() {
+        let weights: Vec<u64> = COMPUTE_SIZES
+            .iter()
+            .map(|s| s_equivalent_weight(s).expect("every compute type is weighted"))
+            .collect();
+        assert_eq!(weights, vec![1, 2, 4, 8]);
+        for pair in weights.windows(2) {
+            assert_eq!(pair[1], pair[0] * 2, "each type doubles the one before");
+        }
+        let order: Vec<&str> = COMPUTE_WEIGHTS.iter().map(|(s, _)| *s).collect();
+        assert_eq!(order, COMPUTE_SIZES, "the weights follow COMPUTE_SIZES");
+        assert_eq!(s_equivalent_weight("xxl"), None);
+        assert_eq!(s_equivalent_weight(""), None);
+    }
+
+    #[test]
+    fn the_included_compute_axis_falls_back_to_the_plan() {
+        let old = Quotas::default();
+        assert_eq!(old.included_compute_hours_for("pro"), MONTH_HOURS);
+        assert_eq!(old.included_compute_hours_for("enterprise"), 0);
+        let pinned = Quotas {
+            included_compute_hours_per_month: Some(11),
+            ..Quotas::default()
+        };
+        assert_eq!(pinned.included_compute_hours_for("team"), 11);
+        let v = serde_json::to_value(Quotas::default()).unwrap();
+        assert!(v.get("included_compute_hours_per_month").is_none(), "{v}");
+        let v = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(v["included_compute_hours_per_month"], 11);
+        assert_eq!(
+            Quotas::default()
+                .resolved_for("team")
+                .included_compute_hours_per_month,
+            Some(3 * MONTH_HOURS)
+        );
+        assert_eq!(
+            pinned.resolved_for("team").included_compute_hours_per_month,
+            Some(11)
+        );
+    }
+
+    /// Every plan carries a tunnel-byte allowance, free is the smallest, and
+    /// only enterprise is unlimited.
+    #[test]
+    fn tunnel_byte_allowance_scales_by_tier() {
+        let bytes = |plan: &str| plan_envelope(plan).1.tunnel_bytes_per_month.unwrap();
+        assert_eq!(bytes("community"), 5 * GIB);
+        assert_eq!(bytes("pro"), 10 * GIB);
+        assert_eq!(bytes("team"), 100 * GIB);
+        assert!(bytes("community") < bytes("pro"));
+        assert!(bytes("pro") < bytes("team"));
+        assert_eq!(bytes("enterprise"), 0, "0 = unlimited");
+        assert_eq!(bytes("bogus"), bytes("community"));
+        // Carried value wins over the compiled one.
+        let pinned = Quotas {
+            tunnel_bytes_per_month: Some(7),
+            ..Quotas::default()
+        };
+        assert_eq!(pinned.tunnel_bytes_for("team"), 7);
+        // Serialized only when set, so a licence without it stays byte-identical.
+        let v = serde_json::to_value(Quotas::default()).unwrap();
+        assert!(v.get("tunnel_bytes_per_month").is_none(), "{v}");
+    }
+
+    /// A licence issued before the events axes reads the plan's compiled
+    /// ones, and one that carries them keeps its own.
+    #[test]
+    fn the_events_axes_fall_back_to_the_plan() {
+        let old = Quotas::default();
+        assert_eq!(old.event_subscriptions_for("pro"), 100);
+        assert_eq!(old.events_delivered_for("pro"), 1_000_000);
+        assert_eq!(old.events_delivered_for("enterprise"), 0, "unlimited");
+        let pinned = Quotas {
+            event_subscriptions: Some(3),
+            events_delivered_per_month: Some(9),
+            ..Quotas::default()
+        };
+        assert_eq!(pinned.event_subscriptions_for("team"), 3);
+        assert_eq!(pinned.events_delivered_for("team"), 9);
+        let v = serde_json::to_value(Quotas::default()).unwrap();
+        assert!(v.get("event_subscriptions").is_none(), "{v}");
+        assert!(v.get("events_delivered_per_month").is_none(), "{v}");
+    }
+
+    #[test]
+    fn the_event_plan_caps_fall_back_to_the_plan_and_tighten_on_free() {
+        let old = Quotas::default();
+        assert_eq!(old.events_ingested_for("community"), 10_000);
+        assert_eq!(old.event_types_for("community"), 10);
+        assert_eq!(old.event_retention_ms_for("community"), DAY_MS);
+        assert_eq!(old.event_retention_events_for("community"), 1_000);
+        assert_eq!(old.event_retention_bytes_for("community"), MIB);
+        assert_eq!(old.event_retry_window_ms_for("community"), 5 * MINUTE_MS);
+        assert_eq!(old.event_types_for("enterprise"), 0, "unlimited");
+        for plan in ["pro", "team"] {
+            assert!(old.event_types_for(plan) > old.event_types_for("community"));
+            assert!(old.event_retention_bytes_for(plan) > MIB);
+            assert!(old.event_retry_window_ms_for(plan) > 5 * MINUTE_MS);
+        }
+        let pinned = Quotas {
+            event_types: Some(2),
+            ..Quotas::default()
+        };
+        assert_eq!(pinned.event_types_for("team"), 2);
+        let v = serde_json::to_value(Quotas::default()).unwrap();
+        for key in [
+            "events_ingested_per_month",
+            "event_types",
+            "event_retention_ms",
+            "event_retention_events",
+            "event_retention_bytes",
+            "event_retry_window_ms",
+        ] {
+            assert!(v.get(key).is_none(), "{key}: {v}");
+        }
+    }
+
+    #[test]
+    fn resolved_quotas_name_what_is_enforced() {
+        let resolved = Quotas::default().resolved_for("community");
+        assert_eq!(resolved.event_subscriptions, Some(10));
+        assert_eq!(resolved.events_ingested_per_month, Some(10_000));
+        assert_eq!(resolved.event_retry_window_ms, Some(5 * MINUTE_MS));
+        let pinned = Quotas {
+            events_delivered_per_month: Some(0),
+            ..Quotas::default()
+        };
+        assert_eq!(
+            pinned.resolved_for("community").events_delivered_per_month,
+            Some(0),
+            "a pinned unlimited stays unlimited"
+        );
     }
 
     use ed25519_dalek::SigningKey;
@@ -962,6 +1579,16 @@ mod tests {
                 tool_invocations_retention_hours: 168,
                 tool_calls_per_month: 0,
                 tunnels: 10,
+                tunnel_bytes_per_month: None,
+                included_compute_hours_per_month: None,
+                event_subscriptions: None,
+                events_delivered_per_month: None,
+                events_ingested_per_month: None,
+                event_types: None,
+                event_retention_ms: None,
+                event_retention_events: None,
+                event_retention_bytes: None,
+                event_retry_window_ms: None,
             },
             residency_domain: String::new(),
             allowed_regions: Vec::new(),
@@ -972,7 +1599,62 @@ mod tests {
             support_tier: "none".into(),
             license_class: "subscription".into(),
             issued_to: None,
+            non_production: false,
         }
+    }
+
+    #[test]
+    fn the_term_follows_the_warning_and_grace_windows() {
+        const DAY: i64 = 86_400;
+        let exp = 1_900_000_000;
+        assert_eq!(LicenseTerm::of(exp, exp - 31 * DAY), LicenseTerm::Current);
+        assert_eq!(
+            LicenseTerm::of(exp, exp - 30 * DAY),
+            LicenseTerm::ExpiringSoon
+        );
+        assert_eq!(LicenseTerm::of(exp, exp - 1), LicenseTerm::ExpiringSoon);
+        assert_eq!(LicenseTerm::of(exp, exp), LicenseTerm::Grace);
+        assert_eq!(LicenseTerm::of(exp, exp + 14 * DAY - 1), LicenseTerm::Grace);
+        assert_eq!(LicenseTerm::of(exp, exp + 14 * DAY), LicenseTerm::Lapsed);
+        assert_eq!(grace_ends_at(exp), exp + 14 * DAY);
+        // The unlicensed envelope never expires.
+        assert_eq!(
+            LicenseClaims::community(AUDIENCE_GATEWAY).term(Utc::now().timestamp()),
+            LicenseTerm::Current
+        );
+    }
+
+    /// A cloud licence keeps its plan seven days past `exp`, a self-host
+    /// licence fourteen.
+    #[test]
+    fn the_grace_follows_the_issuer_role() {
+        const DAY: i64 = 86_400;
+        let exp = 1_900_000_000;
+        let cloud = expiry_grace_days(IssuerRole::Cloud);
+        assert_eq!(cloud, 7);
+        assert_eq!(
+            LicenseTerm::with_grace(exp, exp + 7 * DAY - 1, cloud),
+            LicenseTerm::Grace
+        );
+        assert_eq!(
+            LicenseTerm::with_grace(exp, exp + 7 * DAY, cloud),
+            LicenseTerm::Lapsed
+        );
+        assert_eq!(grace_ends_after(exp, cloud), exp + 7 * DAY);
+        assert_eq!(expiry_grace_days(IssuerRole::SelfHost), EXPIRY_GRACE_DAYS);
+    }
+
+    #[test]
+    fn non_production_is_absent_unless_set_and_defaults_off() {
+        let c = sample_claims(3600);
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("non_production").is_none());
+        let mut marked = c.clone();
+        marked.non_production = true;
+        let json = serde_json::to_value(&marked).unwrap();
+        assert_eq!(json["non_production"], serde_json::json!(true));
+        let back: LicenseClaims = serde_json::from_value(json).unwrap();
+        assert!(back.non_production);
     }
 
     #[test]
@@ -995,6 +1677,31 @@ mod tests {
         assert_eq!(plan_envelope("enterprise").1.tunnels, 0);
         // Unknown plans fall through to the community envelope.
         assert_eq!(plan_envelope("bogus").1.tunnels, 1);
+    }
+
+    /// Self-service enterprise SSO comes with Team and Enterprise, like SAML.
+    #[test]
+    fn enterprise_sso_is_granted_to_team_and_above() {
+        for plan in ["team", "enterprise"] {
+            assert!(
+                features_for(plan)
+                    .iter()
+                    .any(|f| f == FEATURE_SSO_ENTERPRISE),
+                "{plan} grants {FEATURE_SSO_ENTERPRISE}"
+            );
+        }
+        for plan in ["community", "pro"] {
+            assert!(
+                !features_for(plan)
+                    .iter()
+                    .any(|f| f == FEATURE_SSO_ENTERPRISE),
+                "{plan} does not grant {FEATURE_SSO_ENTERPRISE}"
+            );
+        }
+        assert!(matches!(
+            enforcement_of(FEATURE_SSO_ENTERPRISE),
+            Some(FeatureEnforcement::DirectCheck(_))
+        ));
     }
 
     #[test]
@@ -1239,9 +1946,98 @@ mod tests {
         team.features = features_for("team");
         team.plan = "team".into();
         assert!(plugin_load_violation(&team, "dev.mcpg.identity.saml").is_none());
-        assert!(plugin_load_violation(&team, "dev.mcpg.cluster.redis").is_none());
+        assert!(plugin_load_violation(&team, "dev.mcpg.policy.cedar").is_none());
         // Kerberos needs `sso.kerberos`, an enterprise-only feature.
         assert!(plugin_load_violation(&team, "dev.mcpg.identity.kerberos").is_some());
+    }
+
+    /// High availability is Enterprise on every deployment: only the
+    /// enterprise envelope admits the `cluster.*` coordinators, and only
+    /// enterprise carries the `clustering` flag.
+    #[test]
+    fn clustering_is_enterprise_only() {
+        let claims = |plan: &str| {
+            let mut c = LicenseClaims::community("mcpg-gateway");
+            let (entitlements, quotas) = plan_envelope(plan);
+            c.plugin_entitlements = entitlements;
+            c.quotas = quotas;
+            c.features = features_for(plan);
+            c.plan = plan.into();
+            c
+        };
+        for coordinator in ["dev.mcpg.cluster.redis", "dev.mcpg.cluster.nats"] {
+            for plan in ["community", "pro", "team"] {
+                assert!(
+                    matches!(
+                        plugin_load_violation(&claims(plan), coordinator),
+                        Some(LicenseError::PluginNotEntitled(_))
+                    ),
+                    "{plan} must not admit {coordinator}"
+                );
+            }
+            assert!(
+                plugin_load_violation(&claims("enterprise"), coordinator).is_none(),
+                "enterprise admits {coordinator}"
+            );
+        }
+        for plan in ["community", "pro", "team"] {
+            assert!(
+                !features_for(plan).iter().any(|f| f == FEATURE_CLUSTERING),
+                "{plan} must not grant {FEATURE_CLUSTERING}"
+            );
+        }
+        assert!(
+            features_for("enterprise")
+                .iter()
+                .any(|f| f == FEATURE_CLUSTERING)
+        );
+        assert_eq!(
+            enforcement_of(FEATURE_CLUSTERING),
+            Some(FeatureEnforcement::PaidNamespace)
+        );
+    }
+
+    /// A dedicated isolation tier and hybrid gateways on the managed service
+    /// are Enterprise, each checked where the control plane admits it.
+    #[test]
+    fn dedicated_isolation_and_hybrid_gateways_are_enterprise_only() {
+        for feature in [FEATURE_ISOLATION_DEDICATED, FEATURE_HYBRID_GATEWAYS] {
+            for plan in ["community", "pro", "team"] {
+                assert!(
+                    !features_for(plan).iter().any(|f| f == feature),
+                    "{plan} must not grant {feature}"
+                );
+            }
+            assert!(features_for("enterprise").iter().any(|f| f == feature));
+            assert!(matches!(
+                enforcement_of(feature),
+                Some(FeatureEnforcement::DirectCheck(_))
+            ));
+        }
+    }
+
+    /// The platform-coordination grant admits the one coordinator the platform
+    /// adds, and no plan grants it.
+    #[test]
+    fn the_platform_coordination_grant_admits_only_the_platform_coordinator() {
+        let mut pro = LicenseClaims::community("mcpg-cp");
+        pro.features = features_for("pro");
+        assert!(!admits_platform_coordinator(
+            &pro,
+            PLATFORM_COORDINATOR_PLUGIN
+        ));
+        pro.features.push(FEATURE_PLATFORM_COORDINATION.into());
+        assert!(admits_platform_coordinator(
+            &pro,
+            PLATFORM_COORDINATOR_PLUGIN
+        ));
+        assert!(!admits_platform_coordinator(&pro, "dev.mcpg.cluster.redis"));
+        for plan in ["community", "pro", "team", "enterprise"] {
+            assert!(
+                !features_for(plan).contains(&FEATURE_PLATFORM_COORDINATION.to_owned()),
+                "{plan}"
+            );
+        }
     }
 
     #[test]

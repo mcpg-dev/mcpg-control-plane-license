@@ -1,0 +1,40 @@
+# MCPG licence issuer public keys. APPEND ONLY.
+#
+# The only keys a release build trusts to sign a licence. Every record is
+# permanent: a key is never edited or deleted, because an older release still
+# ships it and the tokens it signed are still in the field. A key that must stop
+# being trusted gets a `revoke` record appended below it; releases from then on
+# refuse every token it signed. `trust::tests::the_key_file_is_append_only`
+# holds the file to that rule.
+#
+# Records, one per line, fields separated by whitespace:
+#
+#   key    <kid> <role> <environment> <public-key> <added>
+#   revoke <kid> <revoked-on>
+#
+#   kid          RFC 7638 JWK thumbprint of the key (SHA-256, base64url, no
+#                padding); `mcpg-license keygen` prints it.
+#   role         self_host  signs self-host licences (`mcpg-license issue`)
+#                cloud      signs the licences the mcpg.cloud federation issues
+#                platform   signs no licence: the delivery proofs an mcpg.cloud
+#                           control plane sends with each licence it delivers
+#   environment  production admits any licence
+#                staging    admits only a licence that marks non_production
+#                           (a staging platform key vouches only for a
+#                           delivery of such a licence, or of none)
+#   public-key   the raw 32-byte Ed25519 public key, base64url without padding
+#                (the JWK `x` member)
+#   added, revoked-on   YYYY-MM-DD
+#
+# MCPG's licence key ceremony produces these records: `mcpg-license keygen
+# --role <role> --environment <environment>` prints the record of each new key.
+
+key Wej9_GT1ntIXp_mx9X2I2wtppquI-OWfxYNl5wC2e4k self_host production lzekbDEdypRSSZOXX3kDRcLLYfTsRkcnRTXBubo8uZ4 2026-10-12
+key 3f96x_zTmaJw2kvm2wzHZIe0fVeKdCvGx2XgAm7DyPY self_host production 34OBdUxtUUQw-ylXE8ZzJJ3jYoL9pxH4Km1O3Ucc764 2026-10-12
+key JDTuYyleXAFTmZywEvcdXRzC_zWlkrdbOlZnOPsVqhU self_host staging MUIK9SAzoP1paUc8jm7F_IGt9p79acxgLPAeI0Ih1e4 2026-10-12
+key AH931Z9OQWJnM9sLjeYCSQ0Eb9hwlA7skdRDzS5N0ag cloud production F8MFBLI_isQxXI534ELZGR_bCewUoOKHP-yO5soSZkU 2026-10-12
+key oyMfEC1Li5G3LCsYxSOQbdgHvhdHNuaUoCdiFmljE6I cloud production z4aw3ajhu7I-FR0YCYsimQLGknDd4pI5KbZCoO_igdY 2026-10-12
+key gWQ2toZKLYg1IE99ogkw0s9QNhiimgbcqLnYPqZwqM0 cloud staging U3NelpNPse5D2HfQm-eTiCUxJKVSllPAG5dStkDHIY8 2026-10-12
+key AsvhOhHiTr_Cepn7lrBCB7P3ucoK2cnXuX93TrVW_YU platform production fEybRy5QEmFg7Sz_CeaGacC7uPKrmqhyiutZQk3HvYU 2026-10-12
+key ADWgMkV9h1r-uwO21eWa4qKMfzFtLsHOXXUb2Jqsvdg platform production V0FyqQrhrMwd1pqhtfBaHoRR2W5B9EK4jeiZ0taoNxI 2026-10-12
+key ay2Ux7Js3_s6ZY1zhDG8UXVpKQauvOiWG_yZy7cCtQc platform staging awe2ryg0leDVWz9Dv_KpBVJLDIA2rCocblKiXjdWqyI 2026-10-12
